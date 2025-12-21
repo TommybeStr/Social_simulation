@@ -1,0 +1,100 @@
+data:
+  # 全局批大小（会被按 dp 等分），保持你原值
+  train_batch_size: 4
+  micro_batch_size_per_gpu: 1
+
+  # 数据集文件（已预处理固定行数）
+  train_files: /home/zss/Social_Behavior_Simulation/toothbrush/sft_file/train.parquet
+  val_files:  /home/zss/Social_Behavior_Simulation/toothbrush/sft_file/val.parquet
+  # 单轮对话字段（本例多轮，不使用）
+  prompt_key: null
+  response_key: null
+  prompt_dict_keys: null
+  response_dict_keys: null
+
+  # 多轮对话设置
+  multiturn:
+    enable: true
+    messages_key: messages
+    tools_key: null
+    enable_thinking_key: null
+
+  max_length: 6000
+  truncation: left
+  balance_dp_token: false
+  chat_template: null
+  custom_cls:
+    path: null
+    name: null
+  use_shm: false
+
+model:
+  partial_pretrain: "/home/zss/Social_Behavior_Simulation/Qwen2.5-3B-Instruct"
+
+  # 只训练分类头（关键开关）
+  only_train_cls_heads: false   # << 新增：一键只训头（脚本会自动 cls_weight=1.0, gen_weight=0.0）
+
+  # 冻结策略（FSDP 之前执行）
+  freeze:
+    enable: false               # << 新增：启用冻结
+  trainable_name_prefixes: ["cls_head0.", "cls_head1.","model.layers.32.","model.layers.33.","model.layers.34.","model.layers.35."]  # << 新增：仅解冻两个头
+
+  # 自动把模型切到各张卡上（延续你的设置）
+  device_map: "cuda"
+
+  # 注意：只训头时建议关闭 ckpt 节省开销
+  enable_gradient_checkpointing: true   # << 修改：从 true 改为 false（只训头建议关）
+
+  attn_implementation: "flash_attention_2"
+  trust_remote_code: false
+
+  custom_cls:
+    path: null
+    name: null
+
+  # LoRA 关闭（保持）
+  lora_rank: 0
+  lora_alpha: 16
+  target_modules: all-linear
+  use_liger: false
+
+  # 使用 FSDP 并行
+  strategy: fsdp
+
+  fsdp_config:
+    # 与脚本的混精设置更匹配；如果设备不支持 bf16，可改回 fp32
+    model_dtype: fp32         # << 建议改为 bf16；脚本内部 MixedPrecision 使用 bfloat16
+    cpu_offload: true
+    offload_params: true
+    wrap_policy:
+      type: size_based
+
+optim:
+  # 只训头可以把学习率开大一些（线性层少、收敛更快）
+  lr: 1e-5                     # << 修改：从 1e-6 提升到 1e-3
+  betas: [0.9, 0.999]
+  weight_decay: 0.01           # << 修改：更常见的 decay
+  warmup_steps_ratio: 0.05     # << 修改：合理的 warmup 比例
+  clip_grad: 0.5
+  lr_scheduler: cosine
+
+ulysses_sequence_parallel_size: 1
+use_remove_padding: false
+
+trainer:
+  resume_from_checkpoint: /home/zss/Social_Behavior_Simulation/toothbrush/sft_ckpt/12.16/global_step_800
+  precision: 32
+  project_name: verl-sft
+  experiment_name: Qwen2.5-3B-Instruct  # << 小改名，区分实验
+  total_epochs: 3
+  total_training_steps: null
+  logger: ['console']
+  seed: 42
+  default_local_dir: /home/zss/Social_Behavior_Simulation/toothbrush/sft_ckpt/12.16  #[0.31，0.40，0.29],[0.15，0.85，0.000000001];[0.3325,0.425,0.2425],same;[0.3025,0.425,0.2725],[0.01,0.99,0];[0.3175,0.425,0.2575],[0.001,0.999,0],1e-5;14_1:[0.3275,0.428,0.2445],[0.001,0.999,0],1e-5;14_2:[0.328,0.427,0.245],[0.00001,0.9999,0],1e-4;14_3,same,1e-5；11.15：[0.33,0.42,0.25]，[0.0002,0.998,0];11.16:[0.3325,0.4125,0.255],[0.0002,0.998,0];16_1:[0.331,0.414,0.255],[0.0002,0.9998],5e-6;16_2:[0.3308,0.4167,0.2525],[0.0001,0.9999],1e-6（这一版很接近了，不过第0层0偏低，1偏高，第1层全0）;11.17[0.3308,0.4162,0.253],[0.00005,0.99995];17_2[0.3305,0.4162,0.2533],[0.0002,0.9998];17_3:[0.33,0.4162,0.2538],[0.00015,0.99985];18:[0.3308,0.4167,0.2525],[0.0002,0.998];18_2:[0.3308,0.4167,0.2525],[0.00018,0.99982],1e-6,解冻最后4层; 18_3:[0.3306,0.4167,0.2527],[0.0002,0.9998]
+  save_freq: 800
+  test_freq: 1000000
+  save_best: true
+  save_best_metric: loss
+  max_keep_ckpt: 1
+  default_hdfs_dir: null
+  gradient_clip_val: 0.5

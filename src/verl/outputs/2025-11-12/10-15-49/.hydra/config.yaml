@@ -1,0 +1,76 @@
+data:
+  train_batch_size: 6
+  micro_batch_size_per_gpu: 1
+  train_files: /home/zss/Social_Behavior_Simulation/data_preprocess/sft_data_split/renew_10.28/train.parquet
+  val_files: /home/zss/Social_Behavior_Simulation/data_preprocess/sft_data_split/renew_10.28/val.parquet
+  prompt_key: null
+  response_key: null
+  prompt_dict_keys: null
+  response_dict_keys: null
+  multiturn:
+    enable: true
+    messages_key: messages
+    tools_key: null
+    enable_thinking_key: null
+  max_length: 8192
+  truncation: left
+  balance_dp_token: false
+  chat_template: null
+  custom_cls:
+    path: null
+    name: null
+  use_shm: false
+model:
+  partial_pretrain: /home/zss/Social_Behavior_Simulation/Qwen2.5-3B-Instruct
+  only_train_cls_heads: true
+  freeze:
+    enable: true
+  trainable_name_prefixes:
+  - cls_head0.
+  - cls_head1.
+  device_map: cuda
+  enable_gradient_checkpointing: false
+  attn_implementation: flash_attention_2
+  trust_remote_code: false
+  custom_cls:
+    path: null
+    name: null
+  lora_rank: 0
+  lora_alpha: 16
+  target_modules: all-linear
+  use_liger: false
+  strategy: fsdp
+  fsdp_config:
+    model_dtype: fp32
+    cpu_offload: true
+    offload_params: true
+    wrap_policy:
+      type: size_based
+optim:
+  lr: 1.0e-05
+  betas:
+  - 0.9
+  - 0.999
+  weight_decay: 0.01
+  warmup_steps_ratio: 0.03
+  clip_grad: 0.5
+  lr_scheduler: cosine
+ulysses_sequence_parallel_size: 1
+use_remove_padding: false
+trainer:
+  precision: 32
+  project_name: social-behavior-sft
+  experiment_name: run6gpu
+  total_epochs: 3
+  total_training_steps: null
+  logger:
+  - console
+  seed: 42
+  default_local_dir: /home/zss/Social_Behavior_Simulation/checkpoints/default/renew_11.12_headonly
+  save_freq: 400
+  test_freq: 10000
+  save_best: true
+  save_best_metric: loss
+  max_keep_ckpt: 1
+  default_hdfs_dir: null
+  gradient_clip_val: 0.5
