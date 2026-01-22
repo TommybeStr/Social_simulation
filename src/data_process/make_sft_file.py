@@ -49,11 +49,11 @@ except Exception:
 
 # depth=0（root-第一层）的噪声候选人倍数范围 [min_k, max_k]（浮点数）
 NOISE_K_MIN_DEPTH0 = 0.0
-NOISE_K_MAX_DEPTH0 = 3.0
+NOISE_K_MAX_DEPTH0 = 2.0
 
 # depth=1（第一层-第二层）的噪声候选人倍数范围 [min_k, max_k]（浮点数）
 NOISE_K_MIN_DEPTH1 = 5.0
-NOISE_K_MAX_DEPTH1 = 11.0
+NOISE_K_MAX_DEPTH1 = 10.0
 
 # train部分每条样本的最大gold人数（深度可独立控制）
 MAX_GOLD_PER_SAMPLE_DEPTH0 = 10
@@ -630,22 +630,17 @@ def parse_record_id(sample_id: str) -> str:
     m = _ID_RE.match(str(sample_id))
     return m.group("rec") if m else ""
 
-def main(input_file: str,
-         output_dir: str,
+def main_single_output(
+         input_file: str,
+         output_path: str,
          shuffle_seed: int = 42,
          parquet_batch_size: int = 4000,
          parquet_compression: str = "zstd",
          large_pool_threshold: int = 1000,
-         val_depth2_head: int = 10,
-         val_k_per_chunk: int = None,
          noise_k_min_depth0: float = None,
          noise_k_max_depth0: float = None,
          noise_k_min_depth1: float = None,
          noise_k_max_depth1: float = None):
-    # 如果未指定 val_k_per_chunk，使用默认值
-    if val_k_per_chunk is None:
-        val_k_per_chunk = VAL_K_PER_CHUNK
-    
     # 如果未指定噪音比例，使用默认值
     if noise_k_min_depth0 is None:
         noise_k_min_depth0 = NOISE_K_MIN_DEPTH0
@@ -655,8 +650,7 @@ def main(input_file: str,
         noise_k_min_depth1 = NOISE_K_MIN_DEPTH1
     if noise_k_max_depth1 is None:
         noise_k_max_depth1 = NOISE_K_MAX_DEPTH1
-    
-    os.makedirs(output_dir, exist_ok=True)
+
     with open(input_file, 'r', encoding='utf-8') as fin:
         records = json.load(fin)
     if not isinstance(records, list):
@@ -695,27 +689,7 @@ def main(input_file: str,
 
     rng = random.Random(shuffle_seed)
 
-    # -------- 先按 record_id 分割：train / val --------
-    unique_recs = []
-    for root_user, recs in root_user_to_records.items():
-        for rec in recs:
-            record_id = str(rec.get('id') or '')
-            if record_id and record_id not in unique_recs:
-                unique_recs.append(record_id)
-    
-    rng.shuffle(unique_recs)
-    n_rec = len(unique_recs)
-    
-    # 约 85% 记录作为 train，剩余 15% 作为 val
-    n_train_rec = int(round(n_rec * 0.85))
-    n_train_rec = min(max(n_train_rec, 0), n_rec)  # 防止极端 rounding 问题
-    
-    recs_train = set(unique_recs[:n_train_rec])
-    recs_val   = set(unique_recs[n_train_rec:])
-    
-    print("[split] record_id 级：train/val 记录数 = {}/{}".format(len(recs_train), len(recs_val)))
-
-    # -------- 生成 train 样本（新方式：真实互动者+噪声，限制gold最多10人） --------
+    # -------- 生成 SFT 样本（只输出“原训练格式”：真实互动者+噪声） --------
     rows_train: List[Dict[str, Any]] = []
     train_rec_count = 0
     train_node_count = 0
@@ -727,13 +701,11 @@ def main(input_file: str,
         if len(root_pool_full) > large_pool_threshold:
             continue
         for rec in recs:
-            record_id = str(rec.get('id') or '')
-            if record_id in recs_train:
-                # 统计该 record 中 depth=0 和 depth=1 的节点数
-                for node in iter_tree_nodes(rec):
-                    d = _safe_depth(node)
-                    if d in (0, 1):
-                        total_train_nodes += 1
+            # 统计该 record 中 depth=0 和 depth=1 的节点数
+            for node in iter_tree_nodes(rec):
+                d = _safe_depth(node)
+                if d in (0, 1):
+                    total_train_nodes += 1
     
     with tqdm(total=total_train_nodes, desc="生成train样本（新方式）") as pbar:
         for root_user, recs in root_user_to_records.items():
@@ -742,153 +714,67 @@ def main(input_file: str,
             if len(root_pool_full) > large_pool_threshold:
                 continue
             for rec in recs:
-                record_id = str(rec.get('id') or '')
-                if record_id in recs_train:
-                    # 遍历该 record 中的所有节点，处理 depth=0 和 depth=1 的节点
-                    for node in iter_tree_nodes(rec):
-                        d = _safe_depth(node)
-                        if d in (0, 1):
-                            # 根据 depth 选择对应的噪音比例
-                            if d == 0:
-                                noise_k_min = noise_k_min_depth0
-                                noise_k_max = noise_k_max_depth0
-                            else:  # d == 1
-                                noise_k_min = noise_k_min_depth1
-                                noise_k_max = noise_k_max_depth1
-                            
-                            node_rows = generate_train_rows_for_node(
-                                record=rec,
-                                node=node,
-                                root_user=root_user,
-                                root_potential_full=root_pool_full,
-                                user_interest_map=user_interest_map,
-                                shuffle_seed=shuffle_seed,
-                                noise_k_min=noise_k_min,
-                                noise_k_max=noise_k_max,
-                                user_interaction_count_map=user_interaction_count_map,
-                            )
-                            rows_train.extend(node_rows)
-                            if node_rows:
-                                train_node_count += 1
-                            pbar.update(1)
-                    train_rec_count += 1
-    
-    print(f"[train] 处理了 {train_rec_count} 条记录，{train_node_count} 个节点，共生成 {len(rows_train)} 个样本")
-
-    # -------- 生成 val 样本（原方式：分批送入整个候选池） --------
-    rows_val: List[Dict[str, Any]] = []
-    spans_cache: Dict[Tuple[str, int, int, int], str] = {}  # (root_user, node_id_hash, chunk_idx, target_layer)
-    val_rec_count = 0
-    val_node_count = 0
-    
-    # 计算总节点数（用于进度条）
-    total_val_nodes = 0
-    for root_user, recs in root_user_to_records.items():
-        root_pool_full = root_user_to_candidate_pool.get(root_user, [])
-        if len(root_pool_full) > large_pool_threshold:
-            continue
-        for rec in recs:
-            record_id = str(rec.get('id') or '')
-            if record_id in recs_val:
-                # 统计该 record 中 depth=0 和 depth=1 的节点数
+                # 遍历该 record 中的所有节点，处理 depth=0 和 depth=1 的节点
                 for node in iter_tree_nodes(rec):
                     d = _safe_depth(node)
                     if d in (0, 1):
-                        total_val_nodes += 1
+                        # 根据 depth 选择对应的噪音比例
+                        if d == 0:
+                            noise_k_min = noise_k_min_depth0
+                            noise_k_max = noise_k_max_depth0
+                        else:  # d == 1
+                            noise_k_min = noise_k_min_depth1
+                            noise_k_max = noise_k_max_depth1
+                        
+                        node_rows = generate_train_rows_for_node(
+                            record=rec,
+                            node=node,
+                            root_user=root_user,
+                            root_potential_full=root_pool_full,
+                            user_interest_map=user_interest_map,
+                            shuffle_seed=shuffle_seed,
+                            noise_k_min=noise_k_min,
+                            noise_k_max=noise_k_max,
+                            user_interaction_count_map=user_interaction_count_map,
+                        )
+                        rows_train.extend(node_rows)
+                        if node_rows:
+                            train_node_count += 1
+                        pbar.update(1)
+                train_rec_count += 1
     
-    with tqdm(total=total_val_nodes, desc="生成val样本（原方式）") as pbar:
-        for root_user, recs in root_user_to_records.items():
-            root_pool_full = root_user_to_candidate_pool.get(root_user, [])
-            # 跳过大池根作者
-            if len(root_pool_full) > large_pool_threshold:
-                continue
-            for rec in recs:
-                record_id = str(rec.get('id') or '')
-                if record_id in recs_val:
-                    # 遍历该 record 中的所有节点，处理 depth=0 和 depth=1 的节点
-                    for node in iter_tree_nodes(rec):
-                        d = _safe_depth(node)
-                        if d in (0, 1):
-                            rec_rows = generate_val_rows_for_node(
-                                record=rec,
-                                node=node,
-                                root_user=root_user,
-                                root_potential_full=root_pool_full,
-                                user_interest_map=user_interest_map,
-                                k_per_chunk=val_k_per_chunk,
-                                spans_cache=spans_cache,
-                                user_interaction_count_map=user_interaction_count_map,
-                            )
-                            rows_val.extend(rec_rows)
-                            if rec_rows:
-                                val_node_count += 1
-                            pbar.update(1)
-                    val_rec_count += 1
-    
-    print(f"[val] 处理了 {val_rec_count} 条记录，{val_node_count} 个节点，共生成 {len(rows_val)} 个样本")
-
-    # === 报告每条样本平均候选/平均 gold ===
-    print("\n[train] 统计：")
-    report_candidate_gold_stats(rows_train)
-    print("\n[val] 统计：")
-    report_candidate_gold_stats(rows_val)
+    print(f"[train] 处理了 {train_rec_count} 条记录，{train_node_count} 个节点，共生成 {len(rows_train)} 个样本")
 
     # === 随机打乱训练集 ===
     rng.shuffle(rows_train)
+    save_parquet_rows(rows_train, output_path, batch_size=parquet_batch_size, desc="写 Parquet(SFT-train)", compression=parquet_compression)
 
-    # === 验证集示例：输出有 gold 的样本 ID（最多 N 条） ===
-    val_sample_ids = []
-    for r in rows_val:
-        types = r.get("targets_per_potential_types", []) or []
-        if any(int(t) != 0 for t in types):
-            val_sample_ids.append(str(r.get("id")))
-    # 去重并截取
-    val_sample_ids = list(dict.fromkeys(val_sample_ids))[:max(0, int(val_depth2_head))]
-    if val_sample_ids:
-        print(f"[val] 有 gold 的样本ID（最多 {val_depth2_head} 条）：")
-        for i, sid in enumerate(val_sample_ids, 1):
-            print(f"       {i:02d}. {sid}")
-    else:
-        print("[val] 未找到有 gold 的验证集样本。")
-
-    print("\n[split] 样本条数：train/val = {}/{}".format(len(rows_train), len(rows_val)))
-
-    train_out = os.path.join(output_dir, "train.parquet")
-    val_out   = os.path.join(output_dir, "val.parquet")
-
-    save_parquet_rows(rows_train, train_out, batch_size=parquet_batch_size, desc="写 Parquet(train)", compression=parquet_compression)
-    save_parquet_rows(rows_val,   val_out,   batch_size=parquet_batch_size, desc="写 Parquet(val)",   compression=parquet_compression)
-
-    print("[done] SFT 构造完成（root-第一层 + 第一层-第二层，已输出 2 个 Parquet）")
-    print("train : {}\nval   : {}".format(train_out, val_out))
+    print("[done] SFT 构造完成（只输出训练格式，单文件）")
+    print(f"output: {output_path}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='SFT 构造（root-第一层 + 第一层-第二层；record_id 级切分 + 输出 train/val 两个 Parquet，val≈15%）'
+        description='SFT 构造（root-第一层 + 第一层-第二层；只输出“原训练格式”，单文件）'
     )
-    parser.add_argument('--input', required=True, help='输入 JSON 文件路径（原始树形数据，顶层为 list）')
-    parser.add_argument('--output_dir', required=True, help='输出文件夹（将生成 train.parquet / val.parquet）')
+    parser.add_argument('--input', required=True, help='输入 JSON 文件路径（rebuild_data.py 输出，顶层为 list）')
+    parser.add_argument('--output', required=True, help='输出 Parquet 文件路径（单文件）')
     parser.add_argument('--shuffle_seed', type=int, default=42)
     parser.add_argument('--parquet_batch_size', type=int, default=4000)
     parser.add_argument('--parquet_compression', type=str, default="zstd", help='Parquet 压缩算法（zstd/snappy/uncompressed 等）')
     parser.add_argument('--large_pool_threshold', type=int, default=1000, help='阈值：候选池人数 > 阈值 的根作者将被跳过')
-    parser.add_argument('--val_depth2_head', type=int, default=30, help='在验证集中输出的有 gold 的样本ID数量上限')
-    parser.add_argument('--val_k_per_chunk', type=int, default=None, help='验证集每个chunk的候选人数（默认：30）')
     parser.add_argument('--noise_k_min_depth0', type=float, default=None, help='depth=0 的噪声倍数最小值（默认：0.0）')
-    parser.add_argument('--noise_k_max_depth0', type=float, default=None, help='depth=0 的噪声倍数最大值（默认：3.0）')
-    parser.add_argument('--noise_k_min_depth1', type=float, default=None, help='depth=1 的噪声倍数最小值（默认：0.0）')
-    parser.add_argument('--noise_k_max_depth1', type=float, default=None, help='depth=1 的噪声倍数最大值（默认：3.0）')
+    parser.add_argument('--noise_k_max_depth0', type=float, default=None, help='depth=0 的噪声倍数最大值（默认：2.0）')
+    parser.add_argument('--noise_k_min_depth1', type=float, default=None, help='depth=1 的噪声倍数最小值（默认：5.0）')
+    parser.add_argument('--noise_k_max_depth1', type=float, default=None, help='depth=1 的噪声倍数最大值（默认：10.0）')
     args = parser.parse_args()
 
-    main(
+    main_single_output(
         input_file=args.input,
-        output_dir=args.output_dir,
+        output_path=args.output,
         shuffle_seed=args.shuffle_seed,
         parquet_batch_size=args.parquet_batch_size,
         parquet_compression=args.parquet_compression,
         large_pool_threshold=args.large_pool_threshold,
-        val_depth2_head=args.val_depth2_head,
-        val_k_per_chunk=args.val_k_per_chunk,
         noise_k_min_depth0=args.noise_k_min_depth0,
         noise_k_max_depth0=args.noise_k_max_depth0,
         noise_k_min_depth1=args.noise_k_min_depth1,

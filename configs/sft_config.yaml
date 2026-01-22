@@ -4,7 +4,7 @@ data:
   micro_batch_size_per_gpu: 1
 
   # 数据集文件（已预处理固定行数）
-  train_files: /home/zss/Social_Behavior_Simulation/toothbrush/sft_file/train.parquet
+  train_files: /home/zss/Social_Behavior_Simulation/abcreading/processed/train.parquet
   val_files:  /home/zss/Social_Behavior_Simulation/toothbrush/sft_file/val.parquet
   # 单轮对话字段（本例多轮，不使用）
   prompt_key: null
@@ -82,7 +82,7 @@ ulysses_sequence_parallel_size: 1
 use_remove_padding: false
 
 trainer:
-  resume_from_checkpoint: /home/zss/Social_Behavior_Simulation/toothbrush/sft_ckpt/12.16/global_step_800
+  resume_from_checkpoint: /home/zss/Social_Behavior_Simulation/abcreading/sft_ckpt/global_step_6400
   precision: 32
   project_name: verl-sft
   experiment_name: Qwen2.5-3B-Instruct  # << 小改名，区分实验
@@ -90,9 +90,9 @@ trainer:
   total_training_steps: null
   logger: ['console']
   seed: 42
-  default_local_dir: /home/zss/Social_Behavior_Simulation/toothbrush/sft_ckpt/12.16  #[0.31，0.40，0.29],[0.15，0.85，0.000000001];[0.3325,0.425,0.2425],same;[0.3025,0.425,0.2725],[0.01,0.99,0];[0.3175,0.425,0.2575],[0.001,0.999,0],1e-5;14_1:[0.3275,0.428,0.2445],[0.001,0.999,0],1e-5;14_2:[0.328,0.427,0.245],[0.00001,0.9999,0],1e-4;14_3,same,1e-5；11.15：[0.33,0.42,0.25]，[0.0002,0.998,0];11.16:[0.3325,0.4125,0.255],[0.0002,0.998,0];16_1:[0.331,0.414,0.255],[0.0002,0.9998],5e-6;16_2:[0.3308,0.4167,0.2525],[0.0001,0.9999],1e-6（这一版很接近了，不过第0层0偏低，1偏高，第1层全0）;11.17[0.3308,0.4162,0.253],[0.00005,0.99995];17_2[0.3305,0.4162,0.2533],[0.0002,0.9998];17_3:[0.33,0.4162,0.2538],[0.00015,0.99985];18:[0.3308,0.4167,0.2525],[0.0002,0.998];18_2:[0.3308,0.4167,0.2525],[0.00018,0.99982],1e-6,解冻最后4层; 18_3:[0.3306,0.4167,0.2527],[0.0002,0.9998]
+  default_local_dir: /home/zss/Social_Behavior_Simulation/abcreading/sft_ckpt  #[0.31，0.40，0.29],[0.15，0.85，0.000000001];[0.3325,0.425,0.2425],same;[0.3025,0.425,0.2725],[0.01,0.99,0];[0.3175,0.425,0.2575],[0.001,0.999,0],1e-5;14_1:[0.3275,0.428,0.2445],[0.001,0.999,0],1e-5;14_2:[0.328,0.427,0.245],[0.00001,0.9999,0],1e-4;14_3,same,1e-5；11.15：[0.33,0.42,0.25]，[0.0002,0.998,0];11.16:[0.3325,0.4125,0.255],[0.0002,0.998,0];16_1:[0.331,0.414,0.255],[0.0002,0.9998],5e-6;16_2:[0.3308,0.4167,0.2525],[0.0001,0.9999],1e-6（这一版很接近了，不过第0层0偏低，1偏高，第1层全0）;11.17[0.3308,0.4162,0.253],[0.00005,0.99995];17_2[0.3305,0.4162,0.2533],[0.0002,0.9998];17_3:[0.33,0.4162,0.2538],[0.00015,0.99985];18:[0.3308,0.4167,0.2525],[0.0002,0.998];18_2:[0.3308,0.4167,0.2525],[0.00018,0.99982],1e-6,解冻最后4层; 18_3:[0.3306,0.4167,0.2527],[0.0002,0.9998]
   save_freq: 800
-  test_freq: 1000000
+  test_freq: 100000000
   save_best: true
   save_best_metric: loss
   max_keep_ckpt: 1

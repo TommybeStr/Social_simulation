@@ -1,268 +1,322 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-GRPO 训练数据构建脚本 (扁平化版 - 修正 Depth 逻辑)
-功能：
-1. 模型输入(Prompt)保留真实的 depth (如 1, 2)。
-2. 训练器元数据欺骗为 depth=0 (通过过滤器)。
-3. 真值(GT)扁平化到第 0 层 (适配 Reward 计算)。
+GRPO 训练数据构造脚本 v2.1_clean (修复噪声池污染问题 + 移除死代码)
+逻辑行为：全量处理输入数据，不进行 SFT 拆分。
+修复点：在采样噪声时，严格排除该 Root 下的所有 L1 真实回复者。
 """
 
-import json
-import pandas as pd
-from tqdm import tqdm
-import argparse
 import os
-from hashlib import blake2b
-import re
-import numpy as np
+import json
+import argparse
+import random
+import math
+from collections import defaultdict
+from typing import List, Dict, Any
 
-# ==========================================
-# 复用工具函数 (保持不变)
-# ==========================================
-NO_INTERACTION_STR = "以上用户都不感兴趣，没有发生任何交互"
-_USERNAME_LINE_RE = re.compile(r"^\s*username:\s*(?P<name>.+?)\s*$", re.IGNORECASE | re.MULTILINE)
-_META_ROLE_KEY = "meta"
-ROOT_PARENT_KEY = "__ROOT__" 
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pandas as pd
 
-def _normalize_messages(cell):
-    if cell is None: return []
-    if isinstance(cell, str):
-        try: return json.loads(cell)
-        except: return []
-    try: return list(cell)
-    except: return []
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(x, **kwargs): return x
 
-def _normalize_system(msg):
-    if not msg or msg.get("role") != "system": return None
-    content = msg.get("content", "")
-    try:
-        j = json.loads(content)
-        if isinstance(j, str): content = j
-    except: pass
-    return {"role": "system", "content": content}
+# ==================== 配置 ====================
+SHUFFLE_SEED = 42
+LARGE_POOL_THRESHOLD = 1000
+NOISE_K_MIN = 2.0
+NOISE_K_MAX = 5.0
+MAX_GOLD_PER_SAMPLE = 10 
+ROOT_PARENT_KEY = "__ROOT__"
 
-def _hash_prompt(system_content: str, root_user_str: str) -> str:
-    h = blake2b(digest_size=16)
-    h.update((system_content or "").encode("utf-8"))
-    h.update(b"\x00")
-    h.update((root_user_str or "").encode("utf-8"))
-    return h.hexdigest()
+SYSTEM_PROMPT = f'''你是社交媒体互动预测专家。请严格依据 user 消息中的标注字段进行判断，并输出一个覆盖全部候选的 JSON 数组（顺序必须严格与候选顺序一致）。
+【【输入字段（单样本 JSON）】
+- username：作者
+- interests：作者兴趣（数组）
+- content：正文文本。
+- root_context：根帖子的上下文信息（JSON 格式）
+  * 格式：`root_context: {{"root_username": "根帖子作者名", "root_content": "根帖子内容"}}`
+  * 如果当前节点就是根帖子（depth=0），则 root_username 和 root_content 均为空字符串
+  * 如果当前节点是回复根帖子的节点（depth=1），则包含根帖子的作者名和内容
+  * root_context 用于帮助理解当前回复的上下文，特别是当回复是针对根帖子的评论时
+- 末尾会追加一个特殊段落 `<POTENTIAL_SPANS>`，用于提供候选人信息。
+【关于 potentials】
+- `potentials:` 紧跟在 content 之后，包含所有候选人的 JSON 数组。
+- 格式为：`potentials: [{{"user_name": 候选人, "interests": 候选人兴趣, "depth": 层级, "interaction_count": 互动次数}}, ...]`
+- 这些候选的先后顺序即为评分类与输出顺序的唯一依据；禁止重排、丢失或增添。
+【判断原则（务必遵守）】
+1. 注意interests和interaction_count
+   - 当候选人与作者的 interests 存在明显交集，或候选 interests 与正文 content 中的主题高度相关时，更倾向预测其会发生互动（type=1 或 type=2）。
+   - interaction_count 表示候选人与该作者的历史互动次数，数值越高表示历史互动越频繁，更可能产生新的互动。
+2. 正确理解 depth 的作用：
+   - depth 表示候选在整棵互动/转发树中的层级
+   - depth 越小（越接近根节点），通常代表信息距离更近，更有可能产生直接互动。
+   - depth 较大时仍可能发生互动，但除非 interests 显著匹配或历史互动强信号支持，否则应更谨慎地预测互动。
+3. type 选择和 content 生成：
+   - 当候选人更可能围绕正文内容进行讨论、补充、提问或表达看法时，选择 type=1（评论）。
+   - 当候选人更可能以“转发 + 简短态度/评语”的形式传播时，选择 type=2（转发微博）。
+   - 生成 type=1 或 type=2 的 content 时，应结合作者 content 与双方 interests，生成简短、自然且与话题相关的文本；避免无意义模板句。
+   - 每个候选在当前样本中只能对应一个 type（0 或 1 或 2），不得重复预测或多种类型共存。
+【唯一输出（严格格式）】
+- 输出一个 JSON 数组，长度等于候选数量，顺序与 <POTENTIAL_SPANS> 中候选顺序一致。
+- 数组元素结构：
+  {{"user_name":"...", "content":"...", "type":0/1/2}}
+  - type：0=无互动；1=评论；2=转发微博
+  - content：type=1/2 时输出评论或转发的内容文本（可为空字符串）；type=0 时输出空字符串。
+- 仅输出该 JSON 数组，不得包含解释或多余文本。
+'''
 
-# ==========================================
-# 内容解析工具
-# ==========================================
-def _extract_potentialspan_from_user_content(user_content_str: str) -> list[dict]:
-    if not isinstance(user_content_str, str): return []
-    for prefix in ["potentials:", "potentialspan:"]:
-        idx = user_content_str.find(prefix)
-        if idx >= 0:
-            span_text = user_content_str[idx + len(prefix):].strip()
-            try:
-                arr = json.loads(span_text)
-                if isinstance(arr, list): return arr
-            except: pass
-    return []
 
-def _extract_node_depth_from_user_content(user_content_str: str) -> int:
-    pots = _extract_potentialspan_from_user_content(user_content_str)
-    if pots:
-        try: return int(pots[0].get("depth", 0))
-        except: return 0
-    return 0
+TABLE_SCHEMA = pa.schema([
+    pa.field("id", pa.string()),
+    pa.field("root_user_json", pa.large_string()),
+    pa.field("reward_model", pa.large_string()),
+    pa.field("system_prompt", pa.large_string()),
+    pa.field("sft_chunk_info", pa.large_string()),
+])
 
-def _candidate_order_from_user_content(user_content_str: str) -> list[str]:
-    pots = _extract_potentialspan_from_user_content(user_content_str)
-    order = []
-    for blk in pots:
-        if isinstance(blk, dict):
-            n = str(blk.get("user_name") or "").strip()
-            if n: order.append(n)
-    return order
+# ==================== 工具函数 ====================
 
-def _extract_root_potential_full(user_content_str: str) -> list[dict]:
-    pots = _extract_potentialspan_from_user_content(user_content_str)
-    result = []
-    for blk in pots:
-        if isinstance(blk, dict):
-            obj = {
-                "user_name": str(blk.get("user_name") or "").strip(),
-                "interests": blk.get("interests") or [],
-                "depth": int(blk.get("depth", 0)) if isinstance(blk.get("depth", 0), (int, float, str)) else 0,
-                "interaction_count": int(blk.get("interaction_count", 0)) if isinstance(blk.get("interaction_count", 0), (int, float, str)) else 0,
-            }
-            if obj["user_name"]: result.append(obj)
-    return result
+def _strip_retweet_tail(text: Any) -> str:
+    if not isinstance(text, str): return ""
+    idx = text.find("//@")
+    if idx == -1: return text.strip()
+    return text[:idx].rstrip()
 
-# ==========================================
-# Assistant 解析工具
-# ==========================================
-def _extract_gold_names(assistant_content: str, candidate_order: list) -> list[str]:
-    if not assistant_content: return []
-    try:
-        data = json.loads(assistant_content)
-        if not isinstance(data, list): return []
+def iter_tree_nodes(root: Dict[str, Any]):
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        yield node
+        for child in (node.get('replies') or []):
+            stack.append(child)
+
+def _safe_depth(node: Dict[str, Any]) -> int:
+    try: return int(node.get('depth', 0))
+    except: return 0
+
+def build_child_map(children: List[Dict[str, Any]]) -> Dict[str, Any]:
+    m = {}
+    for c in (children or []):
+        u = str(c.get('user') or "").strip()
+        if u: m[u] = c
+    return m
+
+def extract_node_children_map(root_record: Dict[str, Any]) -> Dict[int, List[Dict[str, Any]]]:
+    mapping = defaultdict(list)
+    for node in iter_tree_nodes(root_record):
+        for child in (node.get('replies') or []):
+            mapping[id(node)].append(child)
+    return mapping
+
+# ==================== 全局 Map 构建 ====================
+
+def build_global_maps(records: List[Dict[str, Any]]):
+    interest_map = {}
+    interact_map = {}
+    root_user_to_records = defaultdict(list)
+    root_user_to_pool = {}
+
+    print("Scanning raw data for global maps...")
+    for rec in tqdm(records, desc="Scanning"):
+        root_user = str(rec.get('user') or "")
+        if root_user:
+            root_user_to_records[root_user].append(rec)
         
-        golds = []
-        for idx, item in enumerate(data):
-            if not isinstance(item, dict): continue
-            try: t = int(item.get("type", 0))
-            except: t = 0
-            if t in (1, 2):
-                uname = (item.get("user_name") or "").strip()
-                if not uname and idx < len(candidate_order):
-                    uname = candidate_order[idx]
-                if uname:
-                    golds.append(uname)
-        return list(set(golds))
-    except:
-        return []
-
-def _extract_meta_from_messages(messages: list[dict]) -> dict | None:
-    for m in messages:
-        if isinstance(m, dict) and m.get("role") == _META_ROLE_KEY:
-            try: return json.loads(m.get("content", ""))
-            except: return None
-    return None
-
-# ==========================================
-# 核心构建逻辑 (扁平化 + 真实 Depth)
-# ==========================================
-def _build_grpo_flat(
-    sft_parquet_path: str,
-    out_jsonl: str,
-    *,
-    data_source: str = "social_grpo_flat",
-    dedup_by_prompt: bool = True,
-    embed_root_potential_full: bool = True,
-):
-    print(f"[load] reading sft parquet: {sft_parquet_path}")
-    df = pd.read_parquet(sft_parquet_path)
-    print(f"[load] rows: {len(df)}")
-
-    samples = []
-    seen = set()
-    
-    for ridx, row in tqdm(df.iterrows(), total=len(df), desc="Build Flat"):
-        msgs = _normalize_messages(row.get("messages"))
-        if len(msgs) < 2: continue
-
-        # 1. 提取内容
-        sys_content = ""
-        user_content = ""
-        asst_content = ""
+        local_pool = set()
+        for node in iter_tree_nodes(rec):
+            u = str(node.get('user') or "").strip()
+            ints = node.get('interests', [])
+            count = int(node.get('interaction_count', 0))
+            if u and ints:
+                if u not in interest_map: interest_map[u] = ints
+                if root_user:
+                    key = (root_user, u)
+                    interact_map[key] = max(interact_map.get(key, 0), count)
+                local_pool.add(u)
         
-        for m in msgs:
-            role = m.get("role")
-            if role == "system":
-                sys_content = _normalize_system(m).get("content", "")
-            elif role == "user":
-                user_content = m.get("content", "")
-            elif role == "assistant":
-                asst_content = m.get("content", "")
+        if root_user:
+            if root_user not in root_user_to_pool: root_user_to_pool[root_user] = set()
+            root_user_to_pool[root_user].update(local_pool)
 
-        if not user_content: continue
+    final_pool = {k: list(v) for k, v in root_user_to_pool.items()}
+    return interest_map, interact_map, root_user_to_records, final_pool
 
-        # 2. 提取信息
-        candidate_order = _candidate_order_from_user_content(user_content)
-        chunk_pots_full = _extract_root_potential_full(user_content)
-        
-        # 【重要】获取真实的 depth (例如 1 或 2)
-        real_depth = _extract_node_depth_from_user_content(user_content)
-        
-        # 3. 提取 Gold
-        gold_users = _extract_gold_names(asst_content, candidate_order)
-        
-        # 4. 构造 Prompt JSON
-        try:
-            root_user_json = json.loads(user_content)
-        except:
-            root_user_json = {"content": user_content}
-            
-        # 【修改点 A】: JSON 里的 depth 设为真实值
-        # 这样训练时 rebuild_user_view 就会把真实的 depth 写进 Prompt 文本里
-        root_user_json["depth"] = int(real_depth) 
-        
-        # _step_depth 设为 0，因为我们的 GT 只有一层，防止 lookup 越界
-        root_user_json["_step_depth"] = 0 
-        
-        # 5. 构造 Reward Model
-        # 将 Gold 放在 cond_gt_by_turn 的第 0 层
-        cond_gt = []
-        if gold_users:
-            cond_gt = [[{ROOT_PARENT_KEY: gold_users}]]
-        else:
-            cond_gt = [[]]
+# ==================== Prompt 构造 ====================
 
-        root_user_json["reward_model"] = {
-            "ground_truth": {
-                "cond_gt_by_turn": cond_gt,
-                "edge_types_by_turn": [], 
-            },
-            "root_potential": {
-                "user_names": candidate_order,
-                **({"full": chunk_pots_full} if embed_root_potential_full else {}),
-            },
-            "root_parent_key": ROOT_PARENT_KEY,
-        }
-
-        root_user_str = json.dumps(root_user_json, ensure_ascii=False)
-        
-        if dedup_by_prompt:
-            key = _hash_prompt(sys_content, root_user_str)
-            if key in seen: continue
-            seen.add(key)
-
-        # 6. 构造 Metadata
-        meta_msg = _extract_meta_from_messages(msgs) or {}
-        sft_chunk_info = {}
-        try:
-            raw_ci = row.get("sft_chunk_info")
-            if isinstance(raw_ci, str): sft_chunk_info = json.loads(raw_ci)
-            elif isinstance(raw_ci, dict): sft_chunk_info = raw_ci
-        except: pass
-        
-        # 【修改点 B】: sft_chunk_info 里的 node_depth 强制设为 0
-        # 这是为了通过 train_grpo_cls_bfs.py 中 Dataset 类的 `if node_depth != 0: continue` 检查
-        sft_info = {
-            **sft_chunk_info, 
-            "record_id": meta_msg.get("record_id") or f"row{ridx}",
-            "real_node_depth": real_depth, # 留个底，万一需要查
-            "node_depth": 0,               # <--- 骗过 Dataset 过滤器
-            "gold_count": len(gold_users)
-        }
-
-        samples.append({
-            "data_source": data_source,
-            "prompt": [
-                {"role": "system", "content": sys_content},
-                {"role": "user", "content": root_user_str}
-            ],
-            "ability": "social_prediction",
-            "sft_chunk_info": sft_info
+def make_potential_json_obj(candidates: List[str], interest_map: Dict, root_user: str, interact_map: Dict) -> List[Dict]:
+    blocks = []
+    for uid in candidates:
+        blocks.append({
+            "user_name": uid,
+            "interests": interest_map.get(uid, []) or [],
+            "depth": 0,
+            "interaction_count": interact_map.get((root_user, uid), 0)
         })
+    return blocks
 
-    os.makedirs(os.path.dirname(out_jsonl) or ".", exist_ok=True)
-    print(f"[write] Writing {len(samples)} lines to {out_jsonl} ...")
+def make_root_user_json_str(node: Dict, potentials: List[Dict]) -> str:
+    content = _strip_retweet_tail(node.get('content') or "")
+    pot_str = json.dumps(potentials, ensure_ascii=False, separators=(',', ':'))
+    root_ctx = {"root_username": "", "root_content": ""}
     
-    with open(out_jsonl, "w", encoding="utf-8") as f:
-        for s in tqdm(samples, desc="Writing JSONL"):
-            f.write(json.dumps(s, ensure_ascii=False) + "\n")
+    full_text = (
+        f"username: {str(node.get('user') or '')}\n"
+        f"content:\n{content}\n"
+        f"userinterest: {json.dumps(node.get('interests', []), ensure_ascii=False)}\n"
+        f"root_context: {json.dumps(root_ctx, ensure_ascii=False, separators=(',', ':'))}\n"
+        f"potentials: {pot_str}"
+    )
+    
+    obj = {
+        "user": str(node.get('user') or ''),
+        "content": full_text,
+        "depth": 0,
+        "_step_depth": 0
+    }
+    return json.dumps(obj, ensure_ascii=False)
+
+# ==================== 样本生成 ====================
+
+def generate_rows(
+    record: Dict[str, Any],
+    record_id: str,
+    node_children_map: Dict[int, List[Dict]],
+    global_pool: List[str],
+    interest_map: Dict,
+    interact_map: Dict,
+    seed: int,
+    noise_min: float,
+    noise_max: float
+) -> List[Dict]:
+    
+    root_node = record
+    if _safe_depth(root_node) != 0: return []
+    root_user = str(root_node.get('user') or "")
+    
+    l1_children_nodes = node_children_map.get(id(root_node), [])
+    l1_map = build_child_map(l1_children_nodes) 
+    l1_names = list(l1_map.keys()) # 【关键】：这是该Root下所有真实的L1回复者
+    
+    if not l1_names: return []
+    
+    gt_layer0 = {ROOT_PARENT_KEY: l1_names}
+    gt_layer1 = {}
+    
+    all_l2_users = set()
+    
+    for l1_name, l1_node in l1_map.items():
+        l2_nodes = node_children_map.get(id(l1_node), [])
+        l2_names = [str(n.get('user') or '').strip() for n in l2_nodes if str(n.get('user') or '').strip()]
+        if l2_names:
+            gt_layer1[l1_name] = l2_names
+            for u2 in l2_names: all_l2_users.add(u2)
             
-    print("[done] Generation complete.")
+    cond_gt_by_turn = [gt_layer0, gt_layer1]
+    
+    rng = random.Random(seed ^ (hash(root_user) & 0xffffffff))
+    rng.shuffle(l1_names)
+    chunks = [l1_names[i:i+MAX_GOLD_PER_SAMPLE] for i in range(0, len(l1_names), MAX_GOLD_PER_SAMPLE)]
+    
+    samples = []
+    
+    for ch_idx, l1_chunk in enumerate(chunks):
+        k = rng.uniform(noise_min, noise_max)
+        total_slots = max(1, math.ceil(k * len(l1_chunk)))
+        
+        # Look-ahead Noise (L2 Users)
+        # 必须排除掉 l1_names 中的人（因为如果某人既是L1又是L2，他在Root视角下是L1真值，不能算作L2噪声）
+        priority_noise = [u for u in all_l2_users if u in interest_map and u not in l1_names and u != root_user]
+        rng.shuffle(priority_noise)
+        
+        selected_noise = []
+        take_n = min(len(priority_noise), total_slots)
+        selected_noise.extend(priority_noise[:take_n])
+        
+        remaining = total_slots - len(selected_noise)
+        if remaining > 0:
+            # 【重要修复】：这里必须使用 set(l1_names)，彻底排除所有真实回复者
+            # 旧逻辑：exclude = set(l1_chunk) -> 导致漏掉的其他L1被选进来当噪声 -> 变成真值 -> 比例失调
+            exclude = set(l1_names) | set(selected_noise) | {root_user}
+            
+            pool_cands = [u for u in global_pool if u not in exclude]
+            if len(pool_cands) >= remaining:
+                selected_noise.extend(rng.sample(pool_cands, remaining))
+            else:
+                selected_noise.extend(pool_cands)
+                
+        final_cands = l1_chunk + selected_noise
+        rng.shuffle(final_cands)
+        
+        pot_objs = make_potential_json_obj(final_cands, interest_map, root_user, interact_map)
+        root_user_json_str = make_root_user_json_str(root_node, pot_objs)
+        
+        reward_model_obj = {
+            "ground_truth": {"cond_gt_by_turn": cond_gt_by_turn},
+            "root_potential": {"full": pot_objs}
+        }
+        
+        samples.append({
+            # 加上 record_id 便于追溯与泄漏检查；不会影响训练逻辑
+            "id": f"{record_id}_{root_user}_{ch_idx}",
+            "root_user_json": root_user_json_str,
+            "reward_model": json.dumps(reward_model_obj, ensure_ascii=False),
+            "system_prompt": SYSTEM_PROMPT,
+            "sft_chunk_info": json.dumps(
+                {"record_id": record_id, "root": root_user, "chunk": ch_idx, "n_l2": take_n},
+                ensure_ascii=False
+            )
+        })
+        
+    return samples
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True, help="rebuild_data.py 输出的树结构 JSON（顶层 list）")
+    parser.add_argument("--output", required=True, help="输出 GRPO 训练 Parquet（单文件）")
+    parser.add_argument("--seed", type=int, default=SHUFFLE_SEED)
+    parser.add_argument("--large_pool_threshold", type=int, default=LARGE_POOL_THRESHOLD)
+    args = parser.parse_args()
+    
+    print(f"Loading raw data: {args.input}")
+    with open(args.input, 'r', encoding='utf-8') as f:
+        records = json.load(f)
+    
+    interest_map, interact_map, root_map, pool_map = build_global_maps(records)
+    
+    all_rows = []
+    print("Generating GRPO samples (single input -> single output)...")
+    for root_user, recs in tqdm(root_map.items()):
+        global_pool = pool_map.get(root_user, [])
+        if len(global_pool) > args.large_pool_threshold: continue
+        
+        for rec in recs:
+            rid = str(rec.get('id') or "")
+            node_children_map = extract_node_children_map(rec)
+            rows = generate_rows(rec, rid, node_children_map, global_pool, interest_map, interact_map, args.seed, NOISE_K_MIN, NOISE_K_MAX)
+            all_rows.extend(rows)
+            
+    print(f"Saving {len(all_rows)} rows to {args.output}...")
+    df = pd.DataFrame(all_rows)
+    
+    if df.empty:
+        print("Error: No data generated!")
+        return
+
+    arrays = [
+        pa.array(df["id"], type=pa.string()),
+        pa.array(df["root_user_json"], type=pa.large_string()),
+        pa.array(df["reward_model"], type=pa.large_string()),
+        pa.array(df["system_prompt"], type=pa.large_string()),
+        pa.array(df["sft_chunk_info"], type=pa.large_string()),
+    ]
+    table = pa.Table.from_arrays(arrays, schema=TABLE_SCHEMA)
+    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    pq.write_table(table, args.output, compression='zstd')
+    print("Done.")
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--val_sft_parquet", required=True, help="Input SFT Parquet path")
-    ap.add_argument("--val_output", required=True, help="Output JSONL path")
-    ap.add_argument("--no_dedup", action="store_true")
-    ap.add_argument("--no_embed_root_potential_full", action="store_true", 
-                    help="Disable embedding full potential objects to save space.")
-    
-    args = ap.parse_args()
-    
-    _build_grpo_flat(
-        sft_parquet_path=args.val_sft_parquet,
-        out_jsonl=args.val_output,
-        dedup_by_prompt=(not args.no_dedup),
-        embed_root_potential_full=(not args.no_embed_root_potential_full)
-    )
+    main()
