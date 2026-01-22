@@ -1,4 +1,4 @@
-# Social Behavior Simulation
+# ReSim
 
 A Reinforcement Learning-based system for predicting and generating social media interactions.
 
