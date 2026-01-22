@@ -2,11 +2,6 @@
 # -*- coding: utf-8 -*-
 
 """
-单轮 SFT 构造脚本（构造 root-第一层回复 + 第一层-第二层回复的数据集）
-- 对 depth 0（root）节点生成样本，预测第一层回复
-  * depth=0 → target_layer=0 → 用分类头0（预测第一层）
-- 对 depth 1（第一层）节点生成样本，预测第二层回复
-  * depth=1 → target_layer=1 → 用分类头1（预测第二层）
 - 每条样本的候选人由两部分构成：
   1. 真实互动用户（真实答案）
   2. k倍于真实互动者人数的噪声候选人，k是可配置的随机数
@@ -15,15 +10,7 @@
 - 每条样本 messages：system + user + assistant
   * assistant 为覆盖候选数组的唯一 JSON 输出
   * user 消息中包含 root_context（如果是 root 节点则置空）
-- 统计&过滤：
-  1) 候选池规模（均值、min/max、阈值计数）
-  2) 样本构造时跳过候选池人数 > 阈值(默认1000)的根作者
-  3) 报告：平均每条样本从多少候选中选出多少 gold（gold=type!=0）
 
-当前版本的切分输出：
-- 按 record_id 划分为 train / val 两部分（约 85% / 15%）
-- 只输出 train.parquet 和 val.parquet
-- 原先 "val + test" 的样本都归入 val
 """
 
 import os

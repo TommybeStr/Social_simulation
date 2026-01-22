@@ -8,9 +8,6 @@
   B) 单文件 .pt / state_dict（兼容旧逻辑）
      用法：--checkpoint_pt /path/to/ckpt.pt
 
-注意：
-- 你现在保存截图这种就是 A)，不要用 load_state_dict() 去塞，它不会生效
-- 正确做法：先加载 base（SFT ckpt），再 PeftModel.from_pretrained(base, adapter_dir)
 """
 
 from __future__ import annotations

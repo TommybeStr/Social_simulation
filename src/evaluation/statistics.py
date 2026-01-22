@@ -2,17 +2,7 @@
 """
 stats_final_v23.py — Strict Intersection & Context-Injected Edition
 
-核心逻辑 (Strict Correspondence):
-1. 【严格匹配】：仅计算 Intersection (交集)。
-   - 遍历模型预测列表 (Preds)。
-   - 只有当 Pred_User 在 Gold_List 中存在时，才视为命中 (Hit)。
-   - 仅对命中的边计算文本分数。幻觉(False Positive)和漏召回(False Negative)不参与文本打分。
-
-2. 【高分复现 (Context Injection)】：
-   - 使用包含 <src_text> 的模板。
-   - Pred 和 Gold 填充完全相同的 src_text (原帖)，确保分数与参考代码一致。
-   
-3. 【配置对齐】：
+【配置对齐】：
    - BERTScore: lang='en', rescale_with_baseline=True
    - ROUGE-L: use_stemmer=True
 """
